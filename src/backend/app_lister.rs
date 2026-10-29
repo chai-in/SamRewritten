@@ -29,7 +29,7 @@ use std::fmt::Display;
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -132,6 +132,57 @@ fn for_each_xml_game<R: BufRead>(
     }
     Ok(())
 }
+fn download_app_list_str(url: &str) -> Result<String, SamError> {
+    dev_println!("ORCH", "Downloading app list from:  {}", url);
+
+    let response = reqwest::blocking::get(url)
+        .map_err(|e| {
+            eprintln!("[ORCHESTRATOR] Failed to download app list: {}", e);
+            SamError::AppListRetrievalFailed
+        })?
+        .text()
+        .map_err(|e| {
+            eprintln!("[ORCHESTRATOR] Failed to decode text from app list: {}", e);
+            SamError::AppListRetrievalFailed
+        })?;
+
+    Ok(response)
+}
+
+/// Refresh the cached app list when missing or older than a week.
+fn ensure_cached_app_list(
+    path: &Path,
+    download: impl FnOnce() -> Result<String, SamError>,
+) -> Result<(), SamError> {
+    let should_update = match fs::metadata(path) {
+        Ok(metadata) => {
+            let last_update = metadata
+                .modified()
+                .map_err(|_| SamError::AppListRetrievalFailed)?;
+            let one_week_ago = SystemTime::now() - Duration::from_hours(7 * 24);
+            last_update < one_week_ago
+        }
+        Err(_) => true,
+    };
+
+    if should_update {
+        let app_list_str = download()?;
+        dev_println!(
+            "ORCH",
+            "App list downloaded. Saving in:  {}",
+            path.display()
+        );
+        fs::write(path, &app_list_str).map_err(|e| {
+            eprintln!("[ORCHESTRATOR] Failed to save app list: {}", e);
+            SamError::AppListRetrievalFailed
+        })?;
+    } else {
+        dev_println!("ORCH", "Loading app list from local location");
+    }
+    Ok(())
+}
+
+
 impl<'a> AppLister<'a> {
     pub fn new(steam_apps_001: &'a SteamApps001, steam_apps: &'a SteamApps) -> Self {
         let cache_dir = get_app_cache_dir();
@@ -150,52 +201,10 @@ impl<'a> AppLister<'a> {
         }
     }
 
-    fn download_app_list_str(&self) -> Result<String, SamError> {
-        dev_println!("ORCH", "Downloading app list from:  {}", &self.app_list_url);
-
-        let response = reqwest::blocking::get(&self.app_list_url)
-            .map_err(|e| {
-                eprintln!("[ORCHESTRATOR] Failed to download app list: {}", e);
-                SamError::AppListRetrievalFailed
-            })?
-            .text()
-            .map_err(|e| {
-                eprintln!("[ORCHESTRATOR] Failed to decode text from app list: {}", e);
-                SamError::AppListRetrievalFailed
-            })?;
-
-        Ok(response)
-    }
-
-    /// Refresh the local cached file if missing or older than a week. Returns
-    /// once the file at `self.app_list_local` is up to date.
     fn ensure_local_app_list(&self) -> Result<(), SamError> {
-        let should_update = match fs::metadata(&self.app_list_local) {
-            Ok(metadata) => {
-                let last_update = metadata
-                    .modified()
-                    .map_err(|_| SamError::AppListRetrievalFailed)?;
-                let one_week_ago = SystemTime::now() - Duration::from_hours(7 * 24);
-                last_update < one_week_ago
-            }
-            Err(_) => true,
-        };
-
-        if should_update {
-            let app_list_str = self.download_app_list_str()?;
-            dev_println!(
-                "ORCH",
-                "App list downloaded. Saving in:  {}",
-                self.app_list_local.display()
-            );
-            fs::write(&self.app_list_local, &app_list_str).map_err(|e| {
-                eprintln!("[ORCHESTRATOR] Failed to save app list: {}", e);
-                SamError::AppListRetrievalFailed
-            })?;
-        } else {
-            dev_println!("ORCH", "Loading app list from local location");
-        }
-        Ok(())
+        ensure_cached_app_list(&self.app_list_local, || {
+            download_app_list_str(&self.app_list_url)
+        })
     }
 
     fn get_app_image_url(&self, app_id: &AppId_t) -> Option<String> {
@@ -422,4 +431,122 @@ pub fn fetch_achievement_counts(
     }
 
     out
+}
+
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const OLD_LIST: &str = "<games><game>480</game></games>";
+    const NEW_LIST: &str = "<games><game>440</game></games>";
+
+    struct CacheFile(PathBuf);
+
+    impl CacheFile {
+        fn new(contents: Option<&str>, stale: bool) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "samrewritten-app-list-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("apps.xml");
+            if let Some(contents) = contents {
+                fs::write(&path, contents).unwrap();
+                if stale {
+                    File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(SystemTime::now() - Duration::from_hours(8 * 24))
+                        .unwrap();
+                }
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for CacheFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn fresh_cache_does_not_download() {
+        let cache = CacheFile::new(Some(OLD_LIST), false);
+        ensure_cached_app_list(&cache.0, || panic!("unexpected download")).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
+    }
+
+    #[test]
+    fn successful_refresh_replaces_expired_cache() {
+        let cache = CacheFile::new(Some(OLD_LIST), true);
+        ensure_cached_app_list(&cache.0, || Ok(NEW_LIST.into())).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), NEW_LIST);
+    }
+
+    #[test]
+    fn failed_refresh_uses_expired_cache_without_touching_it() {
+        let cache = CacheFile::new(Some(OLD_LIST), true);
+        let modified = fs::metadata(&cache.0).unwrap().modified().unwrap();
+        ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
+        assert_eq!(fs::metadata(&cache.0).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn failed_first_download_reports_error() {
+        let cache = CacheFile::new(None, false);
+        assert!(ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err());
+        assert!(!cache.0.exists());
+    }
+
+    #[test]
+    fn html_response_does_not_replace_expired_cache() {
+        let cache = CacheFile::new(Some(OLD_LIST), true);
+        ensure_cached_app_list(&cache.0, || Ok("<html>Service unavailable</html>".into())).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
+    }
+
+    #[test]
+    fn truncated_xml_does_not_replace_expired_cache() {
+        let cache = CacheFile::new(Some(OLD_LIST), true);
+        ensure_cached_app_list(&cache.0, || Ok("<games><game>440</game>".into())).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
+    }
+
+    #[test]
+    fn invalid_fresh_cache_is_repaired() {
+        let cache = CacheFile::new(Some("<html>Bad Gateway</html>"), false);
+        ensure_cached_app_list(&cache.0, || Ok(NEW_LIST.into())).unwrap();
+        assert_eq!(fs::read_to_string(&cache.0).unwrap(), NEW_LIST);
+    }
+
+    #[test]
+    fn invalid_cache_cannot_hide_download_failure() {
+        let cache = CacheFile::new(Some("<html>Bad Gateway</html>"), true);
+        assert!(ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err());
+    }
+
+    #[test]
+    fn http_error_is_not_treated_as_a_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/games.xml", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let result = download_app_list_str(&url);
+        server.join().unwrap();
+        assert!(result.is_err());
+    }
 }
