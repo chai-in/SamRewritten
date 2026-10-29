@@ -1,6 +1,8 @@
 name: cache-regression
 on:
   workflow_dispatch:
+  push:
+    branches: [validation/app-list-cache]
 permissions:
   contents: read
 jobs:
