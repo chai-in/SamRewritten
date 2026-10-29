@@ -28,9 +28,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 pub struct AppLister<'a> {
@@ -135,9 +136,25 @@ fn for_each_xml_game<R: BufRead>(
 fn download_app_list_str(url: &str) -> Result<String, SamError> {
     dev_println!("ORCH", "Downloading app list from:  {}", url);
 
-    let response = reqwest::blocking::get(url)
+    // The default blocking-client deadline can expire while a slow server is
+    // still transferring the list, including on a first launch without a cache.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| {
+            eprintln!("[ORCHESTRATOR] Failed to create app list client: {e}");
+            SamError::AppListRetrievalFailed
+        })?;
+    let response = client
+        .get(url)
+        .send()
         .map_err(|e| {
             eprintln!("[ORCHESTRATOR] Failed to download app list: {}", e);
+            SamError::AppListRetrievalFailed
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            eprintln!("[ORCHESTRATOR] App list server returned an error: {e}");
             SamError::AppListRetrievalFailed
         })?
         .text()
@@ -149,39 +166,109 @@ fn download_app_list_str(url: &str) -> Result<String, SamError> {
     Ok(response)
 }
 
+/// Reject error pages, incomplete downloads and empty lists before caching them.
+fn valid_app_list<R: BufRead>(input: R) -> bool {
+    let mut reader = Reader::from_reader(input);
+    let mut buf = Vec::new();
+    let mut depth = 0usize;
+    let mut saw_root = false;
+    let mut in_game = false;
+    let mut game_count = 0usize;
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                if depth == 0 {
+                    if saw_root || e.name().as_ref() != b"games" {
+                        return false;
+                    }
+                    saw_root = true;
+                }
+                depth += 1;
+                if depth == 2 && e.name().as_ref() == b"game" {
+                    in_game = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                if depth == 0 {
+                    return false;
+                }
+                if depth == 2 && e.name().as_ref() == b"game" {
+                    in_game = false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Text(t)) if in_game => {
+                if t.decode().is_ok_and(|s| s.trim().parse::<u32>().is_ok()) {
+                    game_count += 1;
+                }
+            }
+            Ok(Event::Text(t)) if depth == 0 => {
+                if !t.decode().is_ok_and(|s| s.trim().is_empty()) {
+                    return false;
+                }
+            }
+            Ok(Event::Eof) => return saw_root && depth == 0 && game_count > 0,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+/// Write a complete validated list next to the cache before replacing it.
+fn replace_cache(path: &Path, contents: &str) -> std::io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = File::options().write(true).create_new(true).open(&temp)?;
+    let result = file.write_all(contents.as_bytes()).and_then(|()| {
+        drop(file);
+        fs::rename(&temp, path)
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Refresh the cached app list when missing or older than a week.
 fn ensure_cached_app_list(
     path: &Path,
     download: impl FnOnce() -> Result<String, SamError>,
 ) -> Result<(), SamError> {
-    let should_update = match fs::metadata(path) {
-        Ok(metadata) => {
-            let last_update = metadata
-                .modified()
-                .map_err(|_| SamError::AppListRetrievalFailed)?;
-            let one_week_ago = SystemTime::now() - Duration::from_hours(7 * 24);
-            last_update < one_week_ago
-        }
-        Err(_) => true,
-    };
-
-    if should_update {
-        let app_list_str = download()?;
-        dev_println!(
-            "ORCH",
-            "App list downloaded. Saving in:  {}",
-            path.display()
-        );
-        fs::write(path, &app_list_str).map_err(|e| {
-            eprintln!("[ORCHESTRATOR] Failed to save app list: {}", e);
-            SamError::AppListRetrievalFailed
-        })?;
-    } else {
+    let cache_valid = File::open(path)
+        .map(BufReader::new)
+        .is_ok_and(valid_app_list);
+    let cache_fresh = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified >= SystemTime::now() - Duration::from_hours(7 * 24));
+    if cache_valid && cache_fresh {
         dev_println!("ORCH", "Loading app list from local location");
+        return Ok(());
     }
-    Ok(())
-}
 
+    let refreshed = download().and_then(|contents| {
+        if !valid_app_list(contents.as_bytes()) {
+            eprintln!("[ORCHESTRATOR] Downloaded app list is invalid or incomplete");
+            return Err(SamError::AppListRetrievalFailed);
+        }
+        replace_cache(path, &contents).map_err(|e| {
+            eprintln!("[ORCHESTRATOR] Failed to save app list: {e}");
+            SamError::AppListRetrievalFailed
+        })
+    });
+    match refreshed {
+        Ok(()) => Ok(()),
+        Err(_) if cache_valid => {
+            eprintln!("[ORCHESTRATOR] Using the previous app list after refresh failed");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 impl<'a> AppLister<'a> {
     pub fn new(steam_apps_001: &'a SteamApps001, steam_apps: &'a SteamApps) -> Self {
@@ -433,7 +520,6 @@ pub fn fetch_achievement_counts(
     out
 }
 
-
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -497,13 +583,18 @@ mod cache_tests {
         let modified = fs::metadata(&cache.0).unwrap().modified().unwrap();
         ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
-        assert_eq!(fs::metadata(&cache.0).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            fs::metadata(&cache.0).unwrap().modified().unwrap(),
+            modified
+        );
     }
 
     #[test]
     fn failed_first_download_reports_error() {
         let cache = CacheFile::new(None, false);
-        assert!(ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err());
+        assert!(
+            ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err()
+        );
         assert!(!cache.0.exists());
     }
 
@@ -531,7 +622,9 @@ mod cache_tests {
     #[test]
     fn invalid_cache_cannot_hide_download_failure() {
         let cache = CacheFile::new(Some("<html>Bad Gateway</html>"), true);
-        assert!(ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err());
+        assert!(
+            ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err()
+        );
     }
 
     #[test]
@@ -540,7 +633,9 @@ mod cache_tests {
         let url = format!("http://{}/games.xml", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = [0; 4096];
             stream.read(&mut request).unwrap();
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
