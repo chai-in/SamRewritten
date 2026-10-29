@@ -133,13 +133,14 @@ fn for_each_xml_game<R: BufRead>(
     }
     Ok(())
 }
-fn download_app_list_str(url: &str) -> Result<String, SamError> {
+fn download_app_list_str(url: &str, has_fallback: bool) -> Result<String, SamError> {
     dev_println!("ORCH", "Downloading app list from:  {}", url);
 
     // The default blocking-client deadline can expire while a slow server is
     // still transferring the list, including on a first launch without a cache.
+    let timeout = if has_fallback { 15 } else { 300 };
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(timeout))
         .build()
         .map_err(|e| {
             eprintln!("[ORCHESTRATOR] Failed to create app list client: {e}");
@@ -237,7 +238,7 @@ fn replace_cache(path: &Path, contents: &str) -> std::io::Result<()> {
 /// Refresh the cached app list when missing or older than a week.
 fn ensure_cached_app_list(
     path: &Path,
-    download: impl FnOnce() -> Result<String, SamError>,
+    download: impl FnOnce(bool) -> Result<String, SamError>,
 ) -> Result<(), SamError> {
     let cache_valid = File::open(path)
         .map(BufReader::new)
@@ -250,7 +251,7 @@ fn ensure_cached_app_list(
         return Ok(());
     }
 
-    let refreshed = download().and_then(|contents| {
+    let refreshed = download(cache_valid).and_then(|contents| {
         if !valid_app_list(contents.as_bytes()) {
             eprintln!("[ORCHESTRATOR] Downloaded app list is invalid or incomplete");
             return Err(SamError::AppListRetrievalFailed);
@@ -289,8 +290,8 @@ impl<'a> AppLister<'a> {
     }
 
     fn ensure_local_app_list(&self) -> Result<(), SamError> {
-        ensure_cached_app_list(&self.app_list_local, || {
-            download_app_list_str(&self.app_list_url)
+        ensure_cached_app_list(&self.app_list_local, |has_fallback| {
+            download_app_list_str(&self.app_list_url, has_fallback)
         })
     }
 
@@ -566,14 +567,14 @@ mod cache_tests {
     #[test]
     fn fresh_cache_does_not_download() {
         let cache = CacheFile::new(Some(OLD_LIST), false);
-        ensure_cached_app_list(&cache.0, || panic!("unexpected download")).unwrap();
+        ensure_cached_app_list(&cache.0, |_| panic!("unexpected download")).unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
     }
 
     #[test]
     fn successful_refresh_replaces_expired_cache() {
         let cache = CacheFile::new(Some(OLD_LIST), true);
-        ensure_cached_app_list(&cache.0, || Ok(NEW_LIST.into())).unwrap();
+        ensure_cached_app_list(&cache.0, |_| Ok(NEW_LIST.into())).unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), NEW_LIST);
     }
 
@@ -581,7 +582,11 @@ mod cache_tests {
     fn failed_refresh_uses_expired_cache_without_touching_it() {
         let cache = CacheFile::new(Some(OLD_LIST), true);
         let modified = fs::metadata(&cache.0).unwrap().modified().unwrap();
-        ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).unwrap();
+        ensure_cached_app_list(&cache.0, |has_fallback| {
+            assert!(has_fallback);
+            Err(SamError::AppListRetrievalFailed)
+        })
+        .unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
         assert_eq!(
             fs::metadata(&cache.0).unwrap().modified().unwrap(),
@@ -593,7 +598,11 @@ mod cache_tests {
     fn failed_first_download_reports_error() {
         let cache = CacheFile::new(None, false);
         assert!(
-            ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err()
+            ensure_cached_app_list(&cache.0, |has_fallback| {
+                assert!(!has_fallback);
+                Err(SamError::AppListRetrievalFailed)
+            })
+            .is_err()
         );
         assert!(!cache.0.exists());
     }
@@ -601,21 +610,22 @@ mod cache_tests {
     #[test]
     fn html_response_does_not_replace_expired_cache() {
         let cache = CacheFile::new(Some(OLD_LIST), true);
-        ensure_cached_app_list(&cache.0, || Ok("<html>Service unavailable</html>".into())).unwrap();
+        ensure_cached_app_list(&cache.0, |_| Ok("<html>Service unavailable</html>".into()))
+            .unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
     }
 
     #[test]
     fn truncated_xml_does_not_replace_expired_cache() {
         let cache = CacheFile::new(Some(OLD_LIST), true);
-        ensure_cached_app_list(&cache.0, || Ok("<games><game>440</game>".into())).unwrap();
+        ensure_cached_app_list(&cache.0, |_| Ok("<games><game>440</game>".into())).unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), OLD_LIST);
     }
 
     #[test]
     fn invalid_fresh_cache_is_repaired() {
         let cache = CacheFile::new(Some("<html>Bad Gateway</html>"), false);
-        ensure_cached_app_list(&cache.0, || Ok(NEW_LIST.into())).unwrap();
+        ensure_cached_app_list(&cache.0, |_| Ok(NEW_LIST.into())).unwrap();
         assert_eq!(fs::read_to_string(&cache.0).unwrap(), NEW_LIST);
     }
 
@@ -623,7 +633,7 @@ mod cache_tests {
     fn invalid_cache_cannot_hide_download_failure() {
         let cache = CacheFile::new(Some("<html>Bad Gateway</html>"), true);
         assert!(
-            ensure_cached_app_list(&cache.0, || Err(SamError::AppListRetrievalFailed)).is_err()
+            ensure_cached_app_list(&cache.0, |_| Err(SamError::AppListRetrievalFailed)).is_err()
         );
     }
 
@@ -640,7 +650,7 @@ mod cache_tests {
             stream.read(&mut request).unwrap();
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
-        let result = download_app_list_str(&url);
+        let result = download_app_list_str(&url, false);
         server.join().unwrap();
         assert!(result.is_err());
     }
